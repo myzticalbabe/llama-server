@@ -149,10 +149,50 @@ class Indexer:
         data = json.loads(resp.read())
         return [e['embedding'] for e in data['data']]
 
-    def index_chunks(self, chunks: list[dict], output: Path = INDEX_FILE) -> int:
+    def _existing_chunks(self, output: Path) -> set:
+        """Which (path, offset) chunks are already in the index.
+
+        Resume state is read from the index itself rather than a sidecar
+        checkpoint. A checkpoint file is a second thing to corrupt, go stale,
+        or lose; the index is the artefact that matters, it already carries
+        `path` and `offset` for every chunk, and a truncated final line from a
+        killed process is simply skipped.
+        """
+        seen = set()
+        if not output.exists():
+            return seen
+        with output.open('r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue          # torn final line from a hard kill
+                seen.add((rec.get('path'), rec.get('offset')))
+        return seen
+
+    def index_chunks(self, chunks: list[dict], output: Path = INDEX_FILE,
+                     resume: bool = True) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
+
+        # Without this, a re-run after a crash APPENDS duplicates for every
+        # chunk already written -- output is opened in append mode per batch,
+        # so a partial index silently becomes a corrupt one.
+        done = self._existing_chunks(output) if resume else set()
+        if done:
+            before = len(chunks)
+            chunks = [c for c in chunks
+                      if (c.get('path'), c.get('offset')) not in done]
+            print(f'  resume: {before - len(chunks)} chunks already indexed, '
+                  f'{len(chunks)} to go', flush=True)
+        if not chunks:
+            return 0
+
         total = len(chunks)
         indexed = 0
+        failed = []
 
         for batch_start in range(0, total, self.batch_size):
             batch = chunks[batch_start:batch_start + self.batch_size]
@@ -160,7 +200,11 @@ class Indexer:
             try:
                 embeddings = self.embed_batch(texts)
             except Exception as e:
-                print(f'  Embedding batch failed at chunk {batch_start}: {e}')
+                # Was a bare `continue`: those chunks were skipped silently
+                # and the run still reported success, so an index could look
+                # complete while missing an arbitrary slice of the corpus.
+                print(f'  Embedding batch FAILED at chunk {batch_start}: {e}')
+                failed.append(batch_start)
                 continue
 
             with open(output, 'a', encoding='utf-8') as f:
@@ -173,6 +217,11 @@ class Indexer:
             rate = indexed / elapsed if elapsed > 0 else 0
             print(f'  [{indexed}/{total}] {rate:.1f} chunks/s', flush=True)
 
+        if failed:
+            print(f'  WARNING: {len(failed)} batch(es) failed at offsets '
+                  f'{failed[:10]}{"..." if len(failed) > 10 else ""}. '
+                  f'Those chunks are NOT in the index; re-run with --resume '
+                  f'to fill them.', flush=True)
         return indexed
 
     def index_files(self, file_paths: list[Path], output: Path = INDEX_FILE) -> dict:
@@ -186,7 +235,7 @@ class Indexer:
         print(f'  {len(file_paths)} files -> {len(all_chunks)} chunks')
         if not all_chunks:
             return {'files': len(file_paths), 'chunks': 0, 'indexed': 0}
-        indexed = self.index_chunks(all_chunks, output)
+        indexed = self.index_chunks(all_chunks, output=output)
         return {'files': len(file_paths), 'chunks': len(all_chunks), 'indexed': indexed}
 
     def shutdown(self):
