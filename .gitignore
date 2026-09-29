@@ -1,0 +1,27 @@
+# Model weights -- 58 GB, never source
+models/
+bin/
+target/
+build-spark/
+vendor/
+
+# Generated embeddings and indexes -- rebuilt by the scripts in unified/
+embeddings/
+*.jsonl
+*.gguf
+*.bin
+*.safetensors
+
+# Logs and build noise
+*.log
+build_logs/
+.debug/
+llama_output.txt
+
+# Local state
+*.pid
+*.bak
+*.pre_gate_backup
+__pycache__/
+*.pyc
+.venv/

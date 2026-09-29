@@ -1,0 +1,25 @@
+{
+  "_comment": "Multi-serve plan: parallel inference instances",
+  "_python_314t": "python3.14t.exe free-threaded enables true concurrent threading",
+  "_hardware_notes": "16 GB RAM, 16 cores, Arc 140T 2.1 GB VRAM",
+  "instances": [
+    {
+      "model": "auto",
+      "port": 18080,
+      "task_mode": "chat",
+      "backend": "auto",
+      "label": "primary-chat"
+    },
+    {
+      "model": "auto",
+      "port": 18081,
+      "task_mode": "code",
+      "backend": "auto",
+      "label": "secondary-code"
+    }
+  ],
+  "environment": {
+    "GGML_OPENVINO_DISABLE": "1",
+    "PYTHON_FT": "C:\\Users\\clint\\AppData\\Local\\Programs\\Python\\Python314\\python3.14t.exe"
+  }
+}

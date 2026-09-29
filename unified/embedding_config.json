@@ -1,0 +1,47 @@
+{
+  "embedding_configuration": {
+    "primary": {
+      "provider": "llama_server",
+      "model": "mxbai-embed-large-v1-Q4_k_m.gguf",
+      "base_url": "http://127.0.0.1:18082/v1/embeddings",
+      "model_path": "C:\Users\clint\llama-server\models\mxbai-embed-large-v1\mxbai-embed-large-v1-Q4_k_m.gguf",
+      "description": "mxbai-embed-large-v1 GGUF — SOTA 335M param, 1024 dim, served via llama-server on port 18082"
+    },
+    "fallback": {
+      "provider": "ollama",
+      "model": "nomic-embed-text:latest",
+      "base_url": "http://localhost:11434/api/embeddings",
+      "description": "Fast local Ollama embeddings"
+    },
+    "options": {
+      "qwen3_long_context": {
+        "provider": "ollama",
+        "model": "qwen3-embedding:0.6b",
+        "base_url": "http://localhost:11434/api/embeddings",
+        "description": "Qwen3 0.6B, 639MB, 32K context, 1024 dims (2026-09-12: for long chunks that clip mxbai's 512-token window)"
+      },
+      "openai": {
+        "provider": "openai",
+        "model": "text-embedding-3-small",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "your-openai-api-key-here",
+        "description": "OpenAI embeddings (requires API key)"
+      }
+    }
+  },
+  "instructions": {
+    "setup": [
+      "1. Primary: mxbai-embed-large-v1 GGUF served via llama-server embedding mode on port 18082",
+      "2. Fallback: Ollama nomic-embed-text (ollama pull nomic-embed-text:latest)",
+      "3. For Ollama: Make sure model is pulled (ollama pull nomic-embed-text:latest)",
+      "4. For OpenAI: Add your API key",
+      "5. Restart to apply changes"
+    ],
+    "providers": {
+      "llama_server": "Best quality, 1024-dim, 0.2 GB, direct GGUF via embedding endpoint on port 18082",
+      "ollama": "Fast local embeddings, good for development",
+      "openai": "Premium quality but requires internet and API costs"
+    },
+    "preservation_note": "Existing embeddings are preserved automatically - new embeddings use your configured providers"
+  }
+}
