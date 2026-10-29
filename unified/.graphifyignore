@@ -1,0 +1,8 @@
+# PAMS-GRAPH-004: scope the unified/ graph to live code.
+# pams_314_premeld_backup/ holds pre-meld snapshots (incl. a full-314-tree
+# copy of ai_memory_core.py) — indexing it triples every symbol and makes
+# "what calls this?" return dead code. Live sources only.
+pams_314_premeld_backup/
+__pycache__/
+*.pyc
+graphify-out/
