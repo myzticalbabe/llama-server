@@ -8,9 +8,11 @@ nowhere in `graphify --help`. So the graph is only reachable by shelling out
 to the CLI, which means paying process start + a 44 MB JSON parse per
 question and getting text back instead of tools.
 
-This reads graph.json once, lazily, and exposes the same traversals as
-tools: query, explain, path, affected, god-nodes, stats. Same answers, no
-CLI round trip, and the caller gets structured fields instead of prose.
+This reads graph.json lazily, and re-reads it when the file's mtime or size
+changes, so a `graphify update` no longer needs a server restart. It exposes
+the same traversals as tools: query, explain, path, affected, god-nodes,
+stats. Same answers, no CLI round trip, and the caller gets structured
+fields instead of prose.
 
 Transport is stdio, which is what Kilo launches as a local MCP server.
 
@@ -54,6 +56,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -71,6 +74,13 @@ except ImportError:  # mcp 1.x fallback
 
 _GRAPH: dict[str, Any] | None = None
 _GRAPH_PATH: Path | None = None
+# (st_mtime_ns, st_size) of the file the live index was parsed from. This is
+# the freshness predicate: equal means serve the cache, different means parse
+# again. mtime alone is too coarse (one second, FAT, clock skew); size alone
+# misses an in-place edit of the same length.
+_GRAPH_STAMP: tuple[int, int] | None = None
+_GRAPH_ERROR: str = ""   # why the last reload was skipped, if it was
+_LOAD_LOCK = threading.Lock()
 _NODES: dict[str, dict] = {}
 _ADJ: dict[str, set[str]] = defaultdict(set)
 _INDEX: dict[str, set[str]] = defaultdict(set)   # token -> node ids
@@ -94,35 +104,48 @@ def _default_graph() -> Path:
     return Path.home() / "azazael" / "graphify-out" / "graph.json"
 
 
-def _load() -> None:
-    """Parse graph.json once. 44 MB, so it is cached for the process life."""
-    global _GRAPH, _NODES, _ADJ, _INDEX, _HYPEREDGES, _COMMIT
-    if _GRAPH is not None:
-        return
-    path = _GRAPH_PATH or _default_graph()
-    if not path.exists():
-        raise FileNotFoundError(
-            "graph.json not found at %s -- run `graphify <path>` first" % path)
+def _file_stamp(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size), or None when the file cannot be stat'd right now."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _parse_graph(path: Path) -> dict[str, Any]:
+    """Build a complete index from one graph.json.
+
+    Parsed into local containers, never into the live globals: a reload that
+    died halfway through would otherwise leave every question answered by a
+    partial graph that still looks healthy. Build, then swap.
+    """
     data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    nodes = data.get("nodes", [])
-    edges = data.get("edges", data.get("links", []))
-    for n in nodes:
+    nodes_raw = data.get("nodes", [])
+    edges_raw = data.get("edges", data.get("links", []))
+    nodes: dict[str, dict] = {}
+    adj: dict[str, set[str]] = defaultdict(set)
+    index: dict[str, set[str]] = defaultdict(set)
+    edges: dict[str, list[tuple]] = defaultdict(list)
+    files: dict[str, set[str]] = defaultdict(set)
+    communities: dict[str, list[str]] = defaultdict(list)
+    for n in nodes_raw:
         nid = n.get("id") or n.get("label")
         if not nid:
             continue
-        _NODES[nid] = n
+        nodes[nid] = n
         for tok in set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}",
                                   str(n.get("label", "")).lower())):
-            _INDEX[tok].add(nid)
+            index[tok].add(nid)
         if n.get("source_file"):
-            _FILES[str(n["source_file"])].add(nid)
+            files[str(n["source_file"])].add(nid)
         if n.get("community_name"):
-            _COMMUNITIES[str(n["community_name"])].append(nid)
-    for e in edges:
+            communities[str(n["community_name"])].append(nid)
+    for e in edges_raw:
         s, t = e.get("source"), e.get("target")
-        if s in _NODES and t in _NODES:
-            _ADJ[s].add(t)
-            _ADJ[t].add(s)
+        if s in nodes and t in nodes:
+            adj[s].add(t)
+            adj[t].add(s)
             # The graph object exports with directed=False, but the stored
             # (source, target) tuple still carries semantic orientation:
             # verified across contains/calls/imports/inherits/rationale_for,
@@ -130,12 +153,93 @@ def _load() -> None:
             # rationale side. So these typed edges are usable as directed.
             rel = str(e.get("relation") or "")
             at = e.get("source_location")
-            _EDGES[s].append((t, "out", rel, at))
-            _EDGES[t].append((s, "in", rel, at))
-    _HYPEREDGES.extend(data.get("graph", {}).get("hyperedges")
-                       or data.get("hyperedges") or [])
-    _COMMIT = str(data.get("built_at_commit", ""))
-    _GRAPH = {"nodes": len(_NODES), "edges": len(edges), "path": str(path)}
+            edges[s].append((t, "out", rel, at))
+            edges[t].append((s, "in", rel, at))
+    return {
+        "meta": {"nodes": len(nodes), "edges": len(edges_raw), "path": str(path)},
+        "nodes": nodes,
+        "adj": adj,
+        "index": index,
+        "edges": edges,
+        "files": files,
+        "communities": communities,
+        "hyperedges": list(data.get("graph", {}).get("hyperedges")
+                           or data.get("hyperedges") or []),
+        "commit": str(data.get("built_at_commit", "")),
+    }
+
+
+def _install(parsed: dict[str, Any]) -> None:
+    """Make a parsed index live. Every assignment is a rebind, not a mutation."""
+    global _GRAPH, _NODES, _ADJ, _INDEX, _EDGES, _FILES, _COMMUNITIES
+    global _HYPEREDGES, _COMMIT
+    _NODES = parsed["nodes"]
+    _ADJ = parsed["adj"]
+    _INDEX = parsed["index"]
+    _EDGES = parsed["edges"]
+    _FILES = parsed["files"]
+    _COMMUNITIES = parsed["communities"]
+    _HYPEREDGES = parsed["hyperedges"]
+    _COMMIT = parsed["commit"]
+    _GRAPH = parsed["meta"]
+
+
+def _load() -> None:
+    """(Re)parse graph.json when the file on disk has changed.
+
+    44 MB, so the parsed index is still cached for the process life -- but the
+    cache is now keyed on the file's stamp rather than on "have I ever
+    loaded". A rebuild under a running server used to leave every answer
+    describing a tree the file no longer contained, with nothing in the reply
+    to say so; now the next call after the file changes answers from the new
+    build.
+
+    Two properties this keeps:
+
+    * Unchanged stamp -> no re-parse. A 94 MB JSON parse per question is the
+      cost this cache exists to avoid, so the check is a stat, not a read.
+    * A failed reload never takes the server down. If a rebuild is caught
+      mid-write, the previous index keeps serving and `_GRAPH_ERROR` says
+      why; the stamp still disagrees, so the next call tries again.
+
+    Readers do not take the lock: each container is internally consistent, so
+    a request that races the swap can at worst mix ids from two builds in one
+    answer, which is what it was already getting before the reload existed.
+    """
+    global _GRAPH_STAMP, _GRAPH_ERROR
+    path = _GRAPH_PATH or _default_graph()
+    stamp = _file_stamp(path)
+    if stamp is None:
+        if _GRAPH is None:
+            raise FileNotFoundError(
+                "graph.json not found at %s -- run `graphify <path>` first" % path)
+        _GRAPH_ERROR = "graph.json unreadable at %s; still serving the copy loaded earlier" % path
+        return
+    if _GRAPH is not None and stamp == _GRAPH_STAMP:
+        return
+    with _LOAD_LOCK:
+        # Re-stat under the lock: a concurrent caller may have just reloaded,
+        # and a second parse of the same 94 MB file is pure waste.
+        stamp = _file_stamp(path)
+        if stamp is None:
+            _GRAPH_ERROR = "graph.json unreadable at %s; still serving the copy loaded earlier" % path
+            return
+        if _GRAPH is not None and stamp == _GRAPH_STAMP:
+            return
+        try:
+            parsed = _parse_graph(path)
+        except (OSError, ValueError) as exc:
+            if _GRAPH is None:
+                raise
+            _GRAPH_ERROR = "reload of %s failed (%s: %s); still serving the copy loaded at %s" % (
+                path, type(exc).__name__, exc,
+                _COMMIT or "an earlier build")
+            return
+        _install(parsed)
+        # Only trust the stamp if the file did not move while we read it;
+        # otherwise leave it unset so the next call parses the settled file.
+        _GRAPH_STAMP = stamp if _file_stamp(path) == stamp else None
+        _GRAPH_ERROR = ""
 
 
 
@@ -172,7 +276,10 @@ def codegraph_stats() -> dict:
         "nodes": _GRAPH["nodes"],
         "edges": _GRAPH["edges"],
         "graph_file": _GRAPH["path"],
+        "built_at_commit": _COMMIT,
+        "graph_mtime_ns": _GRAPH_STAMP[0] if _GRAPH_STAMP else None,
         "connected_nodes": len(_ADJ),
+        "reload_error": _GRAPH_ERROR,
     }
 
 
@@ -324,7 +431,8 @@ def _rel_filter(relations: list[str] | None, default: frozenset) -> set | None:
     return set(relations)
 
 
-def _neighbours(nid: str, rels: set | None, direction: str | None = None):
+def _neighbours(nid: str, rels: set | None, direction: str | None = None,
+                bidirectional: bool = False):
     """(other, relation, direction, at) for edges at `nid`, optionally filtered.
 
     `direction` is the STORED direction: "out" = nid is the edge source,
@@ -332,25 +440,34 @@ def _neighbours(nid: str, rels: set | None, direction: str | None = None):
     the (source, target) tuple keeps semantic orientation -- source is the
     container / caller / importer / subclass / rationale side.
 
+    When bidirectional=True, both in-edges and out-edges are traversed
+    regardless of the `direction` filter, enabling reverse dependency
+    discovery (e.g., "what calls this function" from either side).
+
     Iterates a list, not a set, so traversal order -- and therefore which
     shortest path is returned -- is deterministic.
     """
     for other, d, rel, at in _EDGES.get(nid, ()):
         if rels is not None and rel not in rels:
             continue
-        if direction is not None and d != direction:
+        if direction is not None and d != direction and not bidirectional:
             continue
         yield other, rel, d, at
 
 
 @mcp.tool()
-def codegraph_path(a: str, b: str, relations: list[str] | None = None) -> dict:
+def codegraph_path(a: str, b: str, relations: list[str] | None = None,
+                   bidirectional: bool = False) -> dict:
     """Shortest path between two nodes over CODE relations only.
 
     Every hop reports the relation that carried it, so a real call chain is
     distinguishable from a walk through shared documents. Defaults to the
     code relation set; pass relations=["*"] to search every edge type, or
     e.g. relations=["inherits"] for exactly one.
+
+    When bidirectional=True, traverses both in-edges and out-edges, enabling
+    reverse dependency discovery (e.g., finding how A depends on B even when
+    the graph only stores B->A edges).
     """
     _load()
     src, dst = _nid(a), _nid(b)
@@ -365,7 +482,7 @@ def codegraph_path(a: str, b: str, relations: list[str] | None = None) -> dict:
     queue = deque([src])
     while queue:
         cur = queue.popleft()
-        for other, rel, direction, at in _neighbours(cur, rels):
+        for other, rel, direction, at in _neighbours(cur, rels, bidirectional=bidirectional):
             if other in prev:
                 continue
             prev[other] = (cur, rel, direction, at)
@@ -460,6 +577,65 @@ def codegraph_god_nodes(top: int = 10) -> list[dict]:
              "file": n.get("source_file"),
              "community": n.get("community_name")}
             for nid, n in ranked[:max(1, top)]]
+
+
+@mcp.tool()
+def codegraph_export_3d(max_nodes: int = 500, community: str | None = None) -> dict:
+    """Export graph data in 3D force-directed visualization format.
+
+    Returns nodes (with val=degree for sizing, group=community for coloring)
+    and links (with relation type) suitable for vasturiano/3d-force-graph.
+    Optionally filter to a single community. Caps at max_nodes to keep
+    the visualization responsive.
+    """
+    _load()
+    if community:
+        ids = [nid for nid, n in _NODES.items()
+               if str(n.get("community_name", "")) == community]
+    else:
+        # Prioritize high-degree nodes for visualization
+        ranked = sorted(_NODES.items(), key=lambda kv: -len(_ADJ.get(kv[0], ())))
+        ids = [nid for nid, _ in ranked[:max_nodes]]
+
+    id_set = set(ids)
+    nodes = []
+    for nid in ids:
+        n = _NODES[nid]
+        nodes.append({
+            "id": nid,
+            "label": str(n.get("label", nid))[:60],
+            "val": len(_ADJ.get(nid, ())),
+            "group": str(n.get("community_name", "unknown"))[:30],
+            "file": str(n.get("source_file", ""))[:80],
+            "type": str(n.get("file_type", "")),
+        })
+
+    links = []
+    seen_links = set()
+    for nid in ids:
+        for other, d, rel, at in _EDGES.get(nid, ()):
+            if other not in id_set:
+                continue
+            key = (nid, other, rel)
+            if key in seen_links:
+                continue
+            seen_links.add(key)
+            links.append({
+                "source": nid,
+                "target": other,
+                "relation": rel,
+                "direction": d,
+            })
+
+    return {
+        "nodes": nodes,
+        "links": links,
+        "node_count": len(nodes),
+        "link_count": len(links),
+        "truncated": len(_NODES) > len(nodes),
+        "communities": sorted(set(n["group"] for n in nodes)),
+        "format": "3d-force-graph",
+    }
 
 
 # ── resources ─────────────────────────────────────────────────────────────
