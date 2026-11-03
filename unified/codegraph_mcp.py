@@ -26,7 +26,8 @@ Tools
     codegraph_affected(node, depth, relations)
                                         what a change to X would impact
     codegraph_god_nodes(top)           the most connected nodes
-    codegraph_stats()                 graph shape and where the file is
+    codegraph_stats()                 graph shape, provenance, and whether the
+                                      build commit still matches the checkout's HEAD
 
 `codegraph_path` and `codegraph_affected` are relation-typed and report the
 relation that carried every hop. Passing relations=["*"] restores the old
@@ -55,8 +56,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import threading
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
@@ -102,6 +105,138 @@ def _default_graph() -> Path:
     if env:
         return Path(env)
     return Path.home() / "azazael" / "graphify-out" / "graph.json"
+
+
+# A `git rev-parse HEAD` costs ~15 ms here, and codegraph_stats is called often,
+# so the answer is kept for a few seconds. The graph's own freshness is EXACT
+# (mtime_ns + size, checked on every call); this one is a diagnostic, and being
+# up to five seconds behind on "has someone committed" is not a wrong answer to
+# a question whose whole point is "does the graph describe this checkout".
+_HEAD_TTL_S = 5.0
+_HEAD_CACHE: tuple[float, Path, str | None] | None = None
+
+
+def _repo_root(graph_path: Path) -> Path | None:
+    """The git work tree the graph file lives in, or None if there is none."""
+    try:
+        resolved = graph_path.resolve()
+    except OSError:
+        return None
+    for parent in resolved.parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _git_head(root: Path) -> str | None:
+    """HEAD sha of `root`, or None when git cannot answer.
+
+    A subprocess rather than reading .git by hand: HEAD can be a loose ref, a
+    packed ref, or a `gitdir:` file inside a worktree, and re-deriving that
+    resolution is how a staleness warning ends up confidently wrong. A failed
+    lookup returns None and is reported as "not checked", never as "current".
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            # This runs under a client with no console; without the flag
+            # Windows flashes a console window on every call.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _head_commit(root: Path | None) -> str | None:
+    global _HEAD_CACHE
+    if root is None:
+        return None
+    now = time.monotonic()
+    if (_HEAD_CACHE is not None and _HEAD_CACHE[1] == root
+            and now - _HEAD_CACHE[0] < _HEAD_TTL_S):
+        return _HEAD_CACHE[2]
+    sha = _git_head(root)
+    _HEAD_CACHE = (now, root, sha)
+    return sha
+
+
+# Only consulted when the graph's stamp and HEAD already disagree, so it is one
+# extra 15 ms call on the mismatch path, cached on the same TTL.
+_COMMIT_CACHE: dict[tuple[Path, str], tuple[float, bool]] = {}
+
+
+def _commit_in_repo(root: Path, sha: str) -> bool:
+    """Is `sha` a commit of `root`? Distinguishes "behind" from "other tree".
+
+    Without this, any graph sitting somewhere under any work tree gets told to
+    run `graphify update` -- measured on the first pass: a temp graph under
+    C:/Users/clint (its own repo) was compared against the home repo's HEAD and
+    told to update a graph that repo had never built. "Differs" is the right
+    observation there, but the remedy is different, so the two are separated.
+    """
+    now = time.monotonic()
+    hit = _COMMIT_CACHE.get((root, sha))
+    if hit is not None and now - hit[0] < _HEAD_TTL_S:
+        return hit[1]
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", sha + "^{commit}"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        found = out.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        found = False
+    if len(_COMMIT_CACHE) > 64:
+        _COMMIT_CACHE.clear()
+    _COMMIT_CACHE[(root, sha)] = (now, found)
+    return found
+
+
+def _staleness(path: str, built_commit: str) -> dict[str, Any]:
+    """Compare the graph's build commit with the checkout's HEAD.
+
+    The gap this closes: a graph can be internally consistent, freshly
+    reloaded, and still describe a tree from a hundred commits ago. Every
+    answer is then correct about the wrong commit, and nothing in the reply
+    says so -- the caller has to already suspect it to check.
+
+    `graph_matches_head` is equality, not ancestry: claiming "behind" would
+    need a merge-base check, and a graph built from a newer commit than the
+    checkout differs for the same reason and deserves the same sentence.
+    """
+    root = _repo_root(Path(path))
+    head = _head_commit(root)
+    if not built_commit:
+        return {"head_commit": head, "repo_root": str(root) if root else None,
+                "graph_matches_head": None,
+                "warning": "graph.json carries no built_at_commit, so whether it "
+                           "describes this checkout cannot be measured"}
+    if root is None:
+        return {"head_commit": None, "repo_root": None, "graph_matches_head": None,
+                "warning": "no .git above %s, so graph staleness was not checked" % path}
+    if head is None:
+        return {"head_commit": None, "repo_root": str(root), "graph_matches_head": None,
+                "warning": "git could not report HEAD for %s, so graph staleness "
+                           "was not checked" % root}
+    if head == built_commit:
+        return {"head_commit": head, "repo_root": str(root),
+                "graph_matches_head": True, "warning": ""}
+    if not _commit_in_repo(root, built_commit):
+        return {"head_commit": head, "repo_root": str(root),
+                "graph_matches_head": False,
+                "warning": "graph.json was built at %s, which is not a commit of %s "
+                           "(HEAD %s) -- this graph describes a different tree, so "
+                           "its answers may not match this checkout; pass the --graph "
+                           "that belongs to it" % (
+                               built_commit[:12], root, head[:12])}
+    return {"head_commit": head, "repo_root": str(root), "graph_matches_head": False,
+            "warning": "graph.json was built at %s but HEAD of %s is %s -- the graph "
+                       "does not describe this checkout; run `graphify update` (or "
+                       "pass the --graph that belongs to this tree)" % (
+                           built_commit[:12], root.name or str(root), head[:12])}
 
 
 def _file_stamp(path: Path) -> tuple[int, int] | None:
@@ -270,7 +405,7 @@ def _card(nid: str) -> str:
 
 @mcp.tool()
 def codegraph_stats() -> dict:
-    """Shape of the loaded graph and where it came from."""
+    """Shape of the loaded graph, where it came from, and whether it is current."""
     _load()
     return {
         "nodes": _GRAPH["nodes"],
@@ -280,6 +415,7 @@ def codegraph_stats() -> dict:
         "graph_mtime_ns": _GRAPH_STAMP[0] if _GRAPH_STAMP else None,
         "connected_nodes": len(_ADJ),
         "reload_error": _GRAPH_ERROR,
+        **_staleness(_GRAPH["path"], _COMMIT),
     }
 
 
