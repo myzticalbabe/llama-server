@@ -26,7 +26,9 @@ Usage:
 Exit codes: 0 all checks passed, 1 a check failed, 2 could not run (no `mcp`).
 """
 import importlib.util
+import itertools
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -35,6 +37,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REAL_GRAPH = Path(r"C:\Azazael\azazael\graphify-out\graph.json")
+
+_WRITES = itertools.count(1)
 
 
 def _import_codegraph():
@@ -76,11 +80,25 @@ def _git(repo, *args):
 
 
 def _write_graph(path, nodes, commit):
+    """Write a graph.json and make sure the write is visible as a new stamp.
+
+    The loader keys its cache on (mtime_ns, size). Two writes inside one OS
+    tick with the same node count are indistinguishable that way -- and
+    replacing one 40-char sha with another keeps the size identical -- so the
+    module rightly keeps the copy it already parsed, `built_at_commit` still
+    names the previous commit, and the staleness check reads that as a real
+    mismatch. Measured 2026-11-03: bumping from the file's own mtime still
+    collided, because that reading is quantised; 191 of 400 rewrites kept the
+    old stamp. Counting the bump instead separates every write in the process.
+    """
     path.write_text(json.dumps({
         "nodes": [{"id": n, "label": n.upper()} for n in nodes],
         "edges": [],
         "built_at_commit": commit,
     }), encoding="utf-8")
+    st = path.stat()
+    bump = next(_WRITES) * 1_000_000       # +N ms, N = write number, never zero
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + bump))
 
 
 def main() -> int:
@@ -202,7 +220,10 @@ def main() -> int:
             _write_graph(gp, ["a"], second)   # built at HEAD, so no containment check
             fresh(gp)
             for _ in range(5):
-                cg.codegraph_stats()
+                s7 = cg.codegraph_stats()
+            print("     built=%s head=%s matches=%r" % (
+                s7["built_at_commit"][:8], (s7["head_commit"] or "")[:8],
+                s7["graph_matches_head"]))
             c.eq("rev-parse spawns over 5 calls", spawned.count("rev-parse"), 1)
             c.eq("cat-file spawns when it matches", spawned.count("cat-file"), 0)
             spawned.clear()
@@ -214,7 +235,19 @@ def main() -> int:
         finally:
             subprocess.run = real_run
 
-        print("[8] the real graph, as a property not a snapshot")
+        print("[8] the resource carries the same verdict as the tool")
+        _write_graph(gp, ["a"], first)
+        fresh(gp)
+        tool = cg.codegraph_stats()
+        res = json.loads(cg.stats_resource())
+        for key in ("head_commit", "repo_root", "graph_matches_head", "warning"):
+            c.eq("resource %s" % key, res.get(key), tool[key])
+        c.true("resource still carries the histograms",
+               isinstance(res.get("node_kind"), dict), repr(res.get("node_kind")))
+        c.eq("resource reports the same build", res["built_at_commit"],
+             tool["built_at_commit"])
+
+        print("[9] the real graph, as a property not a snapshot")
         if REAL_GRAPH.exists():
             fresh(REAL_GRAPH)
             s = cg.codegraph_stats()

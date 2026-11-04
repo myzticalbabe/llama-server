@@ -37,7 +37,8 @@ tool name implies.
 Resources
 ---------
     codegraph://manifest              index of everything this server exposes
-    codegraph://stats                 shape, build commit, histograms
+    codegraph://stats                 shape, build commit, histograms, and
+                                      whether those answers are current
     codegraph://schema                the graph's own vocabulary -- which
                                      relation/kind/file_type values exist
     codegraph://communities           largest communities and their themes
@@ -847,7 +848,8 @@ def manifest() -> str:
             "codegraph_god_nodes": "highest-degree nodes",
         },
         "resources": {
-            "codegraph://stats": "shape, build commit, top-level histograms",
+            "codegraph://stats": "shape, build commit, top-level histograms, "
+                                 "and the HEAD staleness verdict",
             "codegraph://schema": "relation / node_kind / file_type vocabulary",
             "codegraph://communities": "largest detected communities",
             "codegraph://hyperedges": "asserted multi-node groupings",
@@ -867,14 +869,21 @@ def manifest() -> str:
 
 
 @mcp.resource("codegraph://stats", mime_type="application/json",
-              name="stats", title="Graph shape and provenance")
+              name="stats", title="Graph shape, provenance and staleness")
 def stats_resource() -> str:
-    """Full shape plus the histograms the tools never expose."""
+    """Full shape plus the histograms the tools never expose.
+
+    Carries the same staleness verdict as `codegraph_stats`. A resource reader
+    is at least as likely to be deciding whether to trust the graph as a tool
+    caller is, and two places computing one fact is how the two surfaces end up
+    disagreeing; `_staleness` is therefore shared, not restated.
+    """
     _load()
     nodes = list(_NODES.values())
     return _dump({
         "graph_file": _GRAPH["path"],
         "built_at_commit": _COMMIT,
+        **_staleness(_GRAPH["path"], _COMMIT),
         "nodes": _GRAPH["nodes"],
         "edges": _GRAPH["edges"],
         "connected_nodes": len(_ADJ),
