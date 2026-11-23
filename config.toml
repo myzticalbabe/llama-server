@@ -1,0 +1,107 @@
+# ── llama-server ──────────────────────────────────────────────────────────
+# CPU  : Intel Core Ultra 9 285H  (GenuineIntel / Family 6 / Model 197)
+# GPU  : Intel Arc 140T iGPU 8 GB (VEN_8086 / DEV_7D51)  ← SYCL/Level Zero
+# NPU  : Intel AI Boost NPU      (VEN_8086 / DEV_7D1D)  ← OpenVINO
+# Level Zero SDK 1.28.2 installed
+# Native llama.cpp: b10964 (Sep 14 2026) win-vulkan-x64 — local copy in bin/
+# Model   : gemma-4-E2B-it-IQ4_XS  (model.gguf + mmproj.gguf)
+# Verified : /health=200 /v1/models=200 /v1/chat/completions=200 on port 12780
+# ─────────────────────────────────────────────────────────────────────────
+#
+# 2026-09-17 audit fixes:
+#   * port / backend are now actually honoured (main.rs used to read only the
+#     CLI args and silently ignore both keys).
+#   * llama_cli_path / llama_cli_npu_path pointed at llama-server.exe; the
+#     Jan b9967 bundle ships no llama-cli.exe, so both were dead paths.
+#   * ipex-sycl is NOT referenced: its bundle has a doubled directory
+#     (.../llama-cpp-ipex-llm-2.3.0b20250612-win/llama-cpp-ipex-llm-.../)
+#     and the binary exits 0 with no output — dead end, see unified/SERVERS.md.
+# ─────────────────────────────────────────────────────────────────────────
+
+port               = 8080
+models_dir         = "C:/Users/clint/AppData/Roaming/Jan/data/llamacpp/models"
+n_ctx              = 131072
+n_slots            = 4
+threads            = 8
+
+llama_server_path  = "C:/Users/clint/llama-server/bin/llama-b10964-vulkan/llama-server.exe"
+llama_cli_path     = "C:/Users/clint/llama-server/bin/llama-b10964-vulkan/llama-cli.exe"
+llama_cli_npu_path = "C:/Users/clint/llama-server/bin/ipex-npu/llama-cli-npu.exe"
+
+# Auto-load gemma 4 E2B (2B) at server startup.
+# Local alternative (self-contained, same model + mmproj-F16.gguf):
+#   C:/Users/clint/llama-server/models/gemma-4-E2B/model.gguf
+model_path         = "C:/Users/clint/AppData/Roaming/Jan/data/llamacpp/models/gemma-4-E2B-it-IQ4_XS/model.gguf"
+mmproj_path        = "C:/Users/clint/AppData/Roaming/Jan/data/llamacpp/models/gemma-4-E2B-it-IQ4_XS/mmproj.gguf"
+
+# ── Hardware backend selection ───────────────────────────────────────────
+# cpu  — CPU-only (AVX2 / AVX512 NN auto-detected)
+# sycl — Intel Arc 140T GPU via SYCL/Level Zero
+# npu  — Intel AI Boost NPU via OpenVINO (UNSUPPORTED: ipex-npu ships
+#        llama-cli-npu.exe only, no HTTP server — serve fails fast)
+# auto — auto-detect; measured 2026-09-16 CPU wins/ties SYCL on shared DDR5
+backend            = "auto"
+
+# ── OneAPI Level Zero device selector ───────────────────────────────────
+# Only set this if the auto-detected device is wrong.
+# Use semi-colons for multi-GPU e.g. "level_zero:0;level_zero:1"
+oneapi_device_selector = ""
+
+# ── Reasoning / thinking ─────────────────────────────────────────────────
+# on | off | auto  (default auto). Only forwarded to the native worker when it
+# is NOT "auto" (main.rs), so "auto" leaves the model's own default in place.
+#
+# "off" IS REQUIRED for Open Interpreter and for any client that reads only
+# `message.content`. Measured through this supervisor, same request, gemma-4-E2B:
+#   auto -> finish_reason=length, content='', reasoning_content='Thinking Process...'
+#   off  -> finish_reason=stop,   content='Pong', reasoning_content=None
+# A thinking model streams its trace into `reasoning_content` and leaves
+# `content` EMPTY until thinking ends, so with `auto` the client sees a blank
+# assistant turn and the task silently does nothing.
+reasoning = "off"
+
+# ── Python interpreter auto-load (Open Interpreter) ──────────────────────
+# The Rust server spawns the interpreter once the native backend reports the
+# model resident, so the model can drive the local environment.
+# unified/launch_interpreter.py reads this exact block — one source of truth
+# for both the Rust and Python launch paths.
+[interpreter]
+# Launch automatically after the model loads (on by default).
+auto_start = true
+
+# interpreter.exe (Open Interpreter 0.4.3). Left explicit because discovery
+# also works: venv-interpreter, Python314 Scripts, then PATH.
+path = "C:/Users/clint/venv-interpreter/Scripts/interpreter.exe"
+
+# Profile name. Left EMPTY on purpose: .open-interpreter/profiles/local.yaml
+# is the obsolete 0.2.x schema and 0.4.x ignores it, so the explicit
+# --api_base/--model flags below are the reliable path.
+profile = ""
+
+# Empty => derived from `port` as http://127.0.0.1:<port>/v1
+api_base = ""
+
+# Empty => derived from the loaded GGUF's file stem
+model = ""
+
+# llama.cpp ignores the key, but the OpenAI client requires one.
+api_key = "dummy"
+
+# Launch the REPL in its own console window (Windows: `cmd /c start`).
+# Required: without it the interpreter inherits the headless server's stdio,
+# hits EOF on stdin, prints "Exiting..." and dies the moment it loads.
+# Set false only when launching the interpreter yourself from a terminal.
+new_console = true
+
+# Extra CLI args appended verbatim.
+# Safety posture: no "-y"/"--auto_run" is passed, so Open Interpreter asks
+# before executing generated code. Add "-y" here only if you want it to run
+# code unattended. Other examples: "--safe_mode", "ask"
+args = []
+
+# ── Runtime environment variables ────────────────────────────────────────
+# Passed to the native llama-server child process before launch.
+# e.g. set UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 for >4 GB session LZ allows
+[env]
+# UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS = "1"
+# SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS = "1"

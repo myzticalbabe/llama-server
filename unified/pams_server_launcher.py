@@ -78,6 +78,14 @@ import time
 import urllib.request
 from pathlib import Path
 
+try:
+    import compat_pydantic214  # noqa: F401 -- vendored pydantic-2.14 backfill
+except ImportError:
+    _aztools = 'C:/Azazael/azazael/tools'
+    if _aztools not in sys.path:
+        sys.path.insert(0, _aztools)
+    import compat_pydantic214  # noqa: F401
+
 PAMS_ROOT = Path(os.environ.get("PAMS_ROOT") or (Path.home() / ".pams"))
 PAMS_DATA = PAMS_ROOT / "memory_data"
 PORT_FILE = PAMS_DATA / "mcp_server_port.json"
@@ -306,6 +314,60 @@ def _surface_stale_records() -> None:
               file=sys.stderr)
 
 
+#: The floor proxy is the piece that makes pmb's relevance floor
+#: unconditional: Kilo's `pmb` entry points at 127.0.0.1:8766, so a dead proxy
+#: costs every pmb tool, not just the floor. Kept warm here because this
+#: launcher is already the process that owns pmb-daemon lifecycle.
+FLOOR_PORT = int(os.environ.get("PMB_FLOOR_PORT", "8766"))
+FLOOR_PROXY = os.environ.get(
+    "PMB_FLOOR_PROXY", "C:/Azazael/azazael/tools/pmb_floor_proxy.py")
+FLOOR_PY = os.environ.get(
+    "PMB_FLOOR_PY", "C:/Users/clint/.pmb-venv/Scripts/python.exe")
+
+
+def _floor_port_open(timeout: float = 1.0) -> bool:
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", FLOOR_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _keep_floor_warm() -> None:
+    """Background: keep the pmb floor proxy listening on 127.0.0.1:FLOOR_PORT.
+
+    Restarts are logged with an attempt count; a missing interpreter or script
+    disables the loop outright instead of spinning forever. Opt out with
+    PAMS_FLOOR_AUTOSTART=0.
+    """
+    import subprocess as _sp
+    if os.environ.get("PAMS_FLOOR_AUTOSTART", "1") == "0":
+        return
+    if not (os.path.isfile(FLOOR_PROXY) and os.path.isfile(FLOOR_PY)):
+        print("[pams] floor proxy autostart skipped: missing %s or %s"
+              % (FLOOR_PROXY, FLOOR_PY), file=sys.stderr)
+        return
+    attempts = 0
+    while True:
+        if not _floor_port_open():
+            try:
+                # Declared, not inferred: this proxy is alive only because a
+                # client session started it, so the gate can tell it apart from
+                # the one the logon Startup item owns.
+                _env = dict(os.environ, PMB_FLOOR_ORIGIN="pams")
+                _sp.Popen([FLOOR_PY, FLOOR_PROXY],
+                          stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                          close_fds=True, env=_env)
+                attempts += 1
+                print("[pams] floor proxy started (attempt %d) on 127.0.0.1:%d"
+                      % (attempts, FLOOR_PORT), file=sys.stderr)
+            except Exception as exc:
+                print("[pams] floor proxy spawn failed: %s" % exc,
+                      file=sys.stderr)
+        time.sleep(60)
+
+
 def _keep_pmb_warm() -> None:
     """Background: bring the pmb daemon up and keep stamping its heartbeat.
 
@@ -395,6 +457,29 @@ if _PAMS_SOURCE:
     except Exception:
         pass
 del _p, _PAMS_SOURCE
+
+# The relevance-floor proxy is spawned HERE, ahead of the heavy PAMS imports
+# below, because its bind time is a client-visible deadline. Measured
+# 2026-10-31: opencode's `pmb` entry is a remote MCP server and gives an
+# unreachable endpoint three attempts in 1.65 s, after which it marks the
+# server failed for the whole session -- while this launcher reached the old
+# start site ~3 s in, so every cold start lost the race (ECONNREFUSED at
+# 07:38:22.470, daemon up 07:38:24, proxy bound 07:38:25). Spawning at ~0.2 s
+# puts :8766 inside the window; the proxy itself waits for the daemon.
+_FLOOR_WATCH_STARTED = False
+
+
+def _start_floor_watch() -> None:
+    """Start the keep-warm watcher once. Idempotent: two watchers race."""
+    global _FLOOR_WATCH_STARTED
+    if _FLOOR_WATCH_STARTED:
+        return
+    _FLOOR_WATCH_STARTED = True
+    threading.Thread(target=_keep_floor_warm, name="floor-proxy-watch",
+                     daemon=True).start()
+
+
+_start_floor_watch()
 
 # ai_memory_core.get_base_path is looked up inside AIMemorySystem.__init__ at
 # call time, so rebinding it on the module object is enough. It must happen
@@ -698,6 +783,156 @@ def _install_health_tool() -> bool:
 
     server_cls._get_client_tools = _get_client_tools
     server_cls._execute_tool = _execute_tool
+    return True
+
+
+#: Identity defaults for clients that cannot know the convention.
+#: `mcp_server._execute_tool` / ai_memory_core refuse any call without
+#: user_id and model_id -- "MISSING REQUIRED PARAMETERS ... Do not use
+#: defaults. Provide the actual user identifier and your model name from the
+#: system prompt" -- a contract no MCP client satisfies. Measured live
+#: 2026-10-30: a bare `get_system_health` call dies as
+#: "Input validation error: 'user_id' is a required property", which takes
+#: all 32 tools out of reach for any caller that does not already know the
+#: convention. Filling the two at the MCP BOUNDARY keeps the core's rule
+#: intact (it still never invents an identity itself) while making every
+#: tool callable. Override per host with PAMS_USER_ID / PAMS_MODEL_ID.
+DEFAULT_USER_ID = os.environ.get("PAMS_USER_ID", "clint")
+DEFAULT_MODEL_ID = os.environ.get("PAMS_MODEL_ID", "mcp-client")
+IDENTITY_FIELDS = ("user_id", "model_id")
+
+#: One additive dispatch entry point. Every PAMS tool stays registered and
+#: visible -- this adds a single name that a swarm lane can call without
+#: carrying 32 schemas, and it forwards to the same `_execute_tool` the
+#: individual tools use, so the two paths cannot drift.
+ADMIN_TOOL_NAME = "pams_admin"
+ADMIN_TOOL_DESCRIPTION = (
+    "One entry point for every PAMS action (all 32 pams_* tools). "
+    "`action` is the tool name without its prefix -- e.g. search_memories, "
+    "create_reminder, get_system_health, get_weather_open_meteo -- and "
+    "`params` is that tool's own arguments object. Identity (user_id, "
+    "model_id) is filled automatically, so it may be omitted. "
+    "Use this when a task needs several PAMS calls: one dispatch per action. "
+    "The individual tools remain callable as before."
+)
+
+
+def _install_identity_defaults() -> bool:
+    """Fill user_id/model_id at the MCP boundary; add the pams_admin router.
+
+    Best effort, never fatal -- a launcher patch that cannot find its hook
+    must leave the server exactly as it was rather than half-modified.
+
+    Installed AFTER `_install_health_tool`, so the wrappers chain:
+    this one fills identity, then delegates to the health wrapper (which
+    publishes the caller and handles `daemon_health`), then to the original.
+    """
+    try:
+        from mcp.types import Tool
+    except Exception as exc:
+        print("[pams] identity defaults skipped: %s" % exc, file=sys.stderr)
+        return False
+    server_cls = getattr(mcp_server, "AIMemoryMCPServer", None)
+    original_list = getattr(server_cls, "_get_client_tools", None)
+    original_call = getattr(server_cls, "_execute_tool", None)
+    if not (server_cls and original_list and original_call):
+        print("[pams] identity defaults skipped: no AIMemoryMCPServer API",
+              file=sys.stderr)
+        return False
+    if getattr(server_cls, "_pams_identity_defaults", False):
+        return True
+
+    def _fill(arguments):
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+        for field, default in (("user_id", DEFAULT_USER_ID),
+                              ("model_id", DEFAULT_MODEL_ID)):
+            if not args.get(field):
+                args[field] = default
+        return args
+
+    async def _get_client_tools(self):
+        tools = await original_list(self)
+        for t in tools:
+            try:
+                schema = t.inputSchema if isinstance(t.inputSchema, dict) else None
+                if not schema:
+                    continue
+                props = schema.get("properties")
+                if not isinstance(props, dict):
+                    continue
+                touched = False
+                for field, default in (("user_id", DEFAULT_USER_ID),
+                                      ("model_id", DEFAULT_MODEL_ID)):
+                    if field in props:
+                        props[field].setdefault("default", default)
+                        touched = True
+                if not touched:
+                    continue
+                required = schema.get("required")
+                if isinstance(required, list):
+                    kept = [r for r in required if r not in IDENTITY_FIELDS]
+                    if kept:
+                        schema["required"] = kept
+                    else:
+                        schema.pop("required", None)
+                t.inputSchema = schema
+            except Exception:
+                continue  # one odd schema must not cost the whole surface
+        if not any(getattr(t, "name", None) == ADMIN_TOOL_NAME for t in tools):
+            tools.append(Tool(
+                name=ADMIN_TOOL_NAME,
+                description=ADMIN_TOOL_DESCRIPTION,
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "PAMS tool name without the pams_ "
+                                           "prefix, e.g. search_memories",
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Arguments for that tool",
+                        },
+                    },
+                    "required": ["action"],
+                },
+            ))
+        return tools
+
+    async def _execute_tool(self, name, arguments):
+        args = _fill(arguments)
+        if name == ADMIN_TOOL_NAME:
+            action = str(args.get("action") or "").strip()
+            params = args.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            if not action:
+                return _admin_text_error(
+                    "pams_admin needs an `action` (a pams_* tool name).")
+            if action.startswith("pams_"):
+                action = action[len("pams_"):]
+            if action == ADMIN_TOOL_NAME:
+                return _admin_text_error("pams_admin cannot dispatch to itself.")
+            if not params.get("user_id"):
+                params["user_id"] = args["user_id"]
+            if not params.get("model_id"):
+                params["model_id"] = args["model_id"]
+            return await original_call(self, action, params)
+        return await original_call(self, name, args)
+
+    def _admin_text_error(message):
+        try:
+            from mcp.types import TextContent
+            return [TextContent(type="text", text=message)]
+        except Exception:
+            return message
+
+    server_cls._get_client_tools = _get_client_tools
+    server_cls._execute_tool = _execute_tool
+    server_cls._pams_identity_defaults = True
+    print("[pams] identity defaults installed (user_id=%s model_id=%s) + %s"
+          % (DEFAULT_USER_ID, DEFAULT_MODEL_ID, ADMIN_TOOL_NAME), file=sys.stderr)
     return True
 
 
@@ -1109,7 +1344,13 @@ if __name__ == "__main__":
     if os.name == "nt" and os.environ.get("PAMS_EMBED_AUTOSTART", "1") != "0":
         threading.Thread(target=_keep_embedding_warm, name="embedding-autostart",
                          daemon=True).start()
+    # The relevance floor lives in a proxy in front of the daemon (pmb-ai has
+    # no min-score setting and no newer release carries one). Keep it warm, or
+    # every pmb tool goes dark the moment it stops listening. The watcher was
+    # already started before the heavy imports above -- see _start_floor_watch.
+    _start_floor_watch()
     _install_health_tool()    # publish the daemon/audit verdict to MCP clients
+    _install_identity_defaults()  # every tool callable without an identity
     _install_health_alias_fix()  # verdict reads the portfile's real schema
     _install_caller_identity()  # keep the caller's identity on its own calls
     _install_monitoring_autostart()  # persistence: observers actually start

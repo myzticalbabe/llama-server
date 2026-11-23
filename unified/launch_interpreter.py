@@ -130,6 +130,8 @@ def resolve_interpreter(configured: str) -> Path | None:
     home = Path.home()
     for c in (
         home / "venv-interpreter" / "Scripts" / "interpreter.exe",
+        home / "AppData" / "Local" / "Programs" / "Python" / "Python315"
+        / "Scripts" / "interpreter.exe",
         home / "AppData" / "Local" / "Programs" / "Python" / "Python314"
         / "Scripts" / "interpreter.exe",
         home / ".local" / "bin" / "interpreter",

@@ -52,7 +52,6 @@ question and returns a bounded answer, whereas a resource is a whole
 artefact the caller can hold, diff and re-read. Every one of them reports
 its own truncation rather than silently capping.
 """
-from __future__ import annotations
 
 import argparse
 import json
@@ -64,6 +63,15 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
+
+try:
+    import compat_pydantic214  # noqa: F401 -- vendored pydantic-2.14 backfill
+except ImportError:
+    _aztools = 'C:/Azazael/azazael/tools'
+    if _aztools not in sys.path:
+        sys.path.insert(0, _aztools)
+    import compat_pydantic214  # noqa: F401
+
 
 try:  # mcp 2.x: FastMCP was renamed to MCPServer
     from mcp.server.mcpserver import MCPServer
@@ -141,6 +149,14 @@ def _git_head(root: Path) -> str | None:
         out = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=5,
+            # Never inherit stdin. Under a stdio MCP server stdin is the
+            # request pipe, and Git for Windows blocks on it: measured inside
+            # a live request, `git --version` burned the full 5 s timeout and
+            # returned nothing, while the same call with stdin=DEVNULL
+            # answered in 0.02 s. Every tool that reports staleness then
+            # timed out at the client (-32001) for a reason with nothing to
+            # do with the graph.
+            stdin=subprocess.DEVNULL,
             # This runs under a client with no console; without the flag
             # Windows flashes a console window on every call.
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -186,6 +202,11 @@ def _commit_in_repo(root: Path, sha: str) -> bool:
         out = subprocess.run(
             ["git", "-C", str(root), "cat-file", "-e", sha + "^{commit}"],
             capture_output=True, text=True, timeout=5,
+            # Same inherited-stdin block as _git_head: a git child that reads
+            # the server's request pipe waits until the timeout and answers
+            # nothing, which turns "is this build still in the repo?" into a
+            # false "not a commit of this tree" warning.
+            stdin=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         found = out.returncode == 0
     except (OSError, subprocess.SubprocessError):

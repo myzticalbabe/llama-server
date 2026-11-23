@@ -26,14 +26,23 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(val).expanduser() if val else default
 
 
-# ── Python 3.14 install (free-threaded python3.14t.exe lives here) ──────────
-PYTHON_DIR: Path = _env_path(
-    "PYTHON314_DIR",
-    Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python314")
+# ── Python 3.15 install (free-threaded python3.15t.exe lives here) ──────────
+# Production environment is Python 3.15t. Check PYTHON315_DIR first, then
+# PYTHON314_DIR for backward compat, then default to the installed 3.15 path.
+_PYTHON_DIR_DEFAULT = (
+    Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python315")
+    if os.name == "nt" and Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python315").is_dir()
+    else Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python314")
     if os.name == "nt"
-    else HOME / ".local" / "share" / "python314",
+    else HOME / ".local" / "share" / "python315"
 )
-PYTHON_FT: Path = PYTHON_DIR / "python3.14t.exe"
+PYTHON_DIR: Path = _env_path(
+    "PYTHON315_DIR",
+    _env_path("PYTHON314_DIR", _PYTHON_DIR_DEFAULT),
+)
+# Prefer 3.15t, fall back to 3.14t
+_PYTHON_FT_NAME = "python3.15t.exe" if (PYTHON_DIR / "python3.15t.exe").is_file() else "python3.14t.exe"
+PYTHON_FT: Path = PYTHON_DIR / _PYTHON_FT_NAME
 
 
 def _default_ov_libs() -> Path:
@@ -46,11 +55,14 @@ def _default_ov_libs() -> Path:
             return libs
     except Exception:
         pass
-    return (
-        Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python314\Lib\site-packages\openvino\libs")
+    _ov_default = (
+        Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python315\Lib\site-packages\openvino\libs")
+        if os.name == "nt" and Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python315\Lib\site-packages\openvino\libs").is_dir()
+        else Path(r"C:\Users\clint\AppData\Local\Programs\Python\Python314\Lib\site-packages\openvino\libs")
         if os.name == "nt"
         else HOME / ".local" / "lib" / "openvino"
     )
+    return _ov_default
 
 
 OV_LIBS: Path = _env_path("OV_LIBS_DIR", _default_ov_libs())

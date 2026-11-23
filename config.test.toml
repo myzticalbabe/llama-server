@@ -1,0 +1,27 @@
+# ── llama-server — test profile ───────────────────────────────────────────
+# Minimal config used by check_hw / smoke tests. Kept in sync with config.toml
+# for binary paths.
+#
+# 2026-09-17 audit fix: pointed at Jan backend b8892, which the Jan update
+# removed — every llama_*_path here was dead. Now uses the local b10964 build
+# and the real NPU cli (ipex-npu ships llama-cli-npu.exe, not a server).
+# ─────────────────────────────────────────────────────────────────────────
+
+port       = 8080
+models_dir = "C:/Users/clint/AppData/Roaming/Jan/data/llamacpp/models"
+n_ctx      = 8192
+n_slots    = 4
+threads    = 8
+
+llama_server_path  = "C:/Users/clint/llama-server/bin/llama-b10964-vulkan/llama-server.exe"
+llama_cli_path     = "C:/Users/clint/llama-server/bin/llama-b10964-vulkan/llama-cli.exe"
+llama_cli_npu_path = "C:/Users/clint/llama-server/bin/ipex-npu/llama-cli-npu.exe"
+
+backend = "auto"
+oneapi_device_selector = ""
+
+# Tests do not launch Open Interpreter.
+[interpreter]
+auto_start = false
+
+[env]

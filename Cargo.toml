@@ -1,0 +1,58 @@
+[package]
+name = "llama-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Clint <clint@localhost>"]
+description = """\
+Native llama.cpp (SYCL/Level Zero, Intel Arc GPU, Intel AI Boost NPU)
+inference server — Rust bindings for concurrent CPU / NPU / GPU inference.
+"""
+keywords = ["llm", "inference", "llama", "sycl", "npu", "url", "server"]
+categories = ["api-bindings", "science"]
+license  = "MIT OR Apache-2.0"
+rust-version = "1.75"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.48", features = ["process", "rt-multi-thread", "macros", "signal", "net", "time", "sync", "fs"] }
+
+# HTTP server & client
+axum      = { version = "0.8", features = ["macros", "tokio", "http1"] }
+tower     = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper     = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# "stream" is required by the chat proxy: Open Interpreter (and every OpenAI
+# SDK) sends stream:true, so the native server answers text/event-stream and
+# the proxy must forward the body as a stream instead of buffering it.
+reqwest   = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "native-tls"] }
+
+# Serialization
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap      = { version = "4.5", features = ["derive"] }
+
+# Ctrl-C
+ctrlc     = "3.4"
+
+# Locate binaries on PATH
+which     = "7.0"
+
+# Logging
+tracing   = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Async Tcp check
+bytes     = "1.9"
+
+# Error handling
+anyhow    = "1.0"
+thiserror = "1.0"
+base64    = "0.22"
+toml      = "0.8"
+
+[[bin]]
+name = "llama-server"
+path = "src/main.rs"

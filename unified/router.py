@@ -171,6 +171,27 @@ def compute_launch(model, hw, mode='server', requested_port=0, task_mode=None, i
 
     backend = 'cpu'
     ngl = 0
+    server_exe = SERVER_EXE
+
+    # ── Embedding: GPU offload DOES pay, unlike text generation ──────────
+    # Measured 2026-10-31 on this Arc 140T box, mxbai-embed-large-v1-Q4_k_m,
+    # 400 real chunks, identical args, none of it contended:
+    #   llama-b10964-cpu    -ngl 0                     4.74 chunks/s
+    #   llama-b10964-vulkan -ngl 0, --device none      4.74 chunks/s  <-- real CPU
+    #   llama-b10964-vulkan -ngl 0                    13.91 chunks/s  (still uses the iGPU)
+    #   llama-b10964-vulkan -ngl 99                   26.72 chunks/s
+    #   two vulkan servers on the one iGPU: no aggregate gain (it saturates)
+    # NB -ngl 0 on the vulkan build is NOT a CPU control: the backend still
+    # schedules work on the device (contended, it drops to 2.2 chunks/s). Use
+    # --device none for a true CPU measurement -- it then matches the cpu
+    # build exactly, so the two CPU paths are the same speed.
+    # Vectors are unchanged: cosine 0.99926-0.99954 against CPU, 1024 dims.
+    # Embedding is prefill-only, so the 2026-05-22 *generation* benchmark that
+    # forced cpu does not describe it. Falls back to cpu when no GPU build ships.
+    if task_mode == 'embed':
+        _vk = SERVER_EXE.parent.parent / 'llama-b10964-vulkan' / 'llama-server.exe'
+        if _vk.is_file():
+            backend, ngl, server_exe = 'vulkan', 99, _vk
 
     # Size-based throughput estimate (CPU, 16 threads)
     if model_size_gb <= 2.0:
@@ -195,7 +216,7 @@ def compute_launch(model, hw, mode='server', requested_port=0, task_mode=None, i
             '--threads', str(threads),
             '--batch-size', str(batch_size),
             '--ubatch-size', str(ubatch_size),
-            '--no-warmup', '-ngl', '0',
+            '--no-warmup', '-ngl', str(ngl),
         ]
         if task_mode != 'embed':
             args.extend(['--jinja'])
@@ -238,7 +259,8 @@ def compute_launch(model, hw, mode='server', requested_port=0, task_mode=None, i
         'is_vision': is_vision,
         'mode': mode,
         'task': task_mode,
-        'engine': f'llama-server.exe ({SERVER_EXE})' if mode == 'server' else 'llama-cli',
+        'engine': f'llama-server.exe ({server_exe})' if mode == 'server' else 'llama-cli',
+        'exe': str(server_exe),
         'backend': backend,
         'n_gpu_layers': ngl,
         'context_size': ctx_size,
@@ -260,7 +282,12 @@ def compute_launch(model, hw, mode='server', requested_port=0, task_mode=None, i
         result['notes'].append(f'Low memory: {sys_free_gb:.1f} GB free, model needs ~{model_size_gb * 1.2:.1f} GB')
     if 'mmproj' in meta:
         result['notes'].append(f'Vision model: {meta["mmproj"]}')
-    result['notes'].append('CPU-only (benchmarked 47.4 tok/s gen, 169.9 tok/s prompt for 1.5B)')
+    if backend == 'cpu':
+        result['notes'].append('CPU-only (benchmarked 47.4 tok/s gen, 169.9 tok/s prompt for 1.5B)')
+    else:
+        result['notes'].append(f'{backend} backend, {ngl} GPU layers ')
+        result['notes'].append('measured 2026-10-31: vulkan -ngl 99 embeds at 26.9 chunks/s '
+                               'vs 4.75 for the cpu build (prefill-only workload)')
     if instances > 1:
         result['notes'].append(f'Threads split for {instances} instances: {threads} each')
     result['notes'].append('OpenVINO backend disabled')

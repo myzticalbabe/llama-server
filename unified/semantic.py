@@ -14,7 +14,8 @@ Usage:
 """
 
 import json, os, sys, time, re, argparse, textwrap, urllib.request, urllib.error
-import subprocess
+import base64, subprocess
+from array import array
 from pathlib import Path
 from typing import Any
 
@@ -37,12 +38,104 @@ EMBED_URL = f'http://127.0.0.1:{EMBED_PORT}/v1/embeddings'
 
 INDEX_DIR = Path.home() / 'llama-server' / 'embeddings'
 INDEX_FILE = INDEX_DIR / 'semantic_index.jsonl'
+
+# Growth guard (2026-10-30). The index is append-only by design (opening it in
+# append mode per batch is what makes a killed run resumable), and nothing
+# bounded it: semantic_index.jsonl reached 1.68 GB with no rotation policy, so
+# a rebuild could only ever add. Over the cap, `index_chunks` now compacts
+# (dedupe by path+offset, keep the newest record) before appending, and refuses
+# to grow a file whose duplicates are already gone -- a size problem with no
+# duplicate cause is the operator's call via `--rebuild`, not a silent balloon.
+INDEX_MAX_MB = int(os.environ.get('SEMANTIC_INDEX_MAX_MB', '512'))
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 64
 EMBED_DIM = 1024          # mxbai-embed-large-v1 native dim
 
 TEXT_EXTS = corpus.TEXT_EXTS
 SKIP_DIRS = corpus.SKIP_DIRS
+
+
+def pack_embedding(emb: list[float]) -> str:
+    """Encode an embedding as base64 float32 (~5.5 KB for 1024 dims).
+
+    A JSON float array of the same vector is ~20 KB, and 71 765 chunks of that
+    is how the index reached 1.68 GB with zero duplicate records in it. Float32
+    loses nothing here: the vectors arrive as float32 and cosine distance at
+    this precision is far below the rerank tie-break.
+    """
+    return base64.b64encode(array('f', emb).tobytes()).decode('ascii')
+
+
+def unpack_embedding(rec: dict) -> list[float]:
+    """Read either encoding, so an old index stays readable."""
+    b64 = rec.get('embedding_b64')
+    if b64:
+        a = array('f')
+        a.frombytes(base64.b64decode(b64))
+        return a.tolist()
+    return rec['embedding']
+
+
+def compact_index(index: Path = INDEX_FILE,
+                  drop_prefixes: list[str] | None = None) -> dict:
+    """Rewrite an index keeping only the NEWEST record per (path, offset).
+
+    Append-per-batch means a crash mid-run or a partial re-index leaves older
+    duplicates behind; they cost full embedding-tensor memory on load and are
+    pure waste on disk. Atomic: written to a sibling temp file and os.replace'd,
+    so an interrupted compaction cannot truncate a good index. Returns measured
+    before/after counts -- the caller decides, it does not assert success.
+
+    `drop_prefixes` (added 2026-10-31) removes records whose path CONTAINS one
+    of the given substrings, case-insensitively. It exists because a run started
+    before the corpus was trimmed embedded archived shards, graph dumps and
+    tokenizer JSON; those records keep answering searches after the exclusion
+    that stopped them from being written, so deduplication alone cannot remove
+    them. Counts are reported per prefix, so a reader can see what was purged
+    rather than trusting a single total.
+    """
+    out = {'records_before': 0, 'records_after': 0, 'duplicates_dropped': 0,
+           'size_before_mb': 0.0, 'size_after_mb': 0.0, 'corrupt_lines': 0,
+           'dropped_by_prefix': {}, 'dropped_total': 0, 'index': str(index)}
+    drops = [p.lower() for p in (drop_prefixes or [])]
+    if not index.exists():
+        return out
+    out['size_before_mb'] = index.stat().st_size / 1e6
+    keep: dict[tuple, dict] = {}
+    with index.open('r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            out['records_before'] += 1
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                out['corrupt_lines'] += 1   # torn tail from a hard kill
+                continue
+            path_low = str(rec.get('path') or '').replace('\\', '/').lower()
+            hit = next((p for p in drops if p in path_low), None)
+            if hit is not None:
+                out['dropped_by_prefix'][hit] = out['dropped_by_prefix'].get(hit, 0) + 1
+                out['dropped_total'] += 1
+                continue
+            keep[(rec.get('path'), rec.get('offset'))] = rec
+    out['records_after'] = len(keep)
+    out['duplicates_dropped'] = (out['records_before'] - out['dropped_total']
+                                 - out['records_after'])
+
+    repacked = 0
+    tmp = index.with_suffix(index.suffix + '.compact.tmp')
+    with tmp.open('w', encoding='utf-8') as f:
+        for rec in keep.values():
+            if 'embedding' in rec and 'embedding_b64' not in rec:
+                rec['embedding_b64'] = pack_embedding(rec.pop('embedding'))
+                repacked += 1
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    out['embeddings_repacked'] = repacked
+    os.replace(tmp, index)
+    out['size_after_mb'] = index.stat().st_size / 1e6
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -173,9 +266,31 @@ class Indexer:
                 seen.add((rec.get('path'), rec.get('offset')))
         return seen
 
+    def _index_size_mb(self, output: Path) -> float:
+        try:
+            return output.stat().st_size / 1e6
+        except OSError:
+            return 0.0
+
     def index_chunks(self, chunks: list[dict], output: Path = INDEX_FILE,
                      resume: bool = True) -> int:
         output.parent.mkdir(parents=True, exist_ok=True)
+
+        # Over the growth cap: compact first, so a runaway file is repaired by
+        # the same run that would otherwise extend it.
+        if self._index_size_mb(output) > INDEX_MAX_MB:
+            before_mb = self._index_size_mb(output)
+            print(f'  index is {before_mb:.0f} MB (cap {INDEX_MAX_MB} MB) '
+                  f'-- compacting before append', flush=True)
+            stats = compact_index(output)
+            print(f'  compact: {stats["records_before"]} -> {stats["records_after"]} '
+                  f'records, {before_mb:.0f} -> {stats["size_after_mb"]:.0f} MB '
+                  f'({stats["duplicates_dropped"]} duplicates dropped)', flush=True)
+            if self._index_size_mb(output) > INDEX_MAX_MB:
+                print(f'  WARNING: still {self._index_size_mb(output):.0f} MB over the '
+                      f'{INDEX_MAX_MB} MB cap with no duplicates left. That is corpus '
+                      f'size, not waste. Raise SEMANTIC_INDEX_MAX_MB or rebuild with '
+                      f'`index --rebuild --all`.', flush=True)
 
         # Without this, a re-run after a crash APPENDS duplicates for every
         # chunk already written -- output is opened in append mode per batch,
@@ -209,7 +324,8 @@ class Indexer:
 
             with open(output, 'a', encoding='utf-8') as f:
                 for chunk, emb in zip(batch, embeddings):
-                    record = {**chunk, 'embedding': emb, 'dim': EMBED_DIM}
+                    record = {**chunk, 'embedding_b64': pack_embedding(emb),
+                              'dim': EMBED_DIM}
                     f.write(json.dumps(record, ensure_ascii=False) + '\n')
                     indexed += 1
 
@@ -272,7 +388,7 @@ class Searcher:
             if line.strip():
                 record = json.loads(line)
                 self.chunks.append(record)
-                self.embeddings.append(record['embedding'])
+                self.embeddings.append(unpack_embedding(record))
         self._build_bm25()
         self._loaded = True
         print(f'  Loaded {len(self.chunks)} chunks from index')
@@ -451,6 +567,16 @@ def _scan_files(roots: list[Path]) -> list[Path]:
 
 
 def cmd_index(args):
+    # --rebuild: rotate the old index aside instead of appending to it. This is
+    # the only way to SHRINK the file, which is the escape hatch the growth
+    # guard points at when compaction finds no duplicates to remove.
+    if getattr(args, 'rebuild', False) and INDEX_FILE.exists():
+        bak = INDEX_FILE.with_suffix(INDEX_FILE.suffix + '.bak')
+        if bak.exists():
+            bak.unlink()
+        os.replace(INDEX_FILE, bak)
+        print(f'  --rebuild: previous index moved to {bak.name} '
+              f'({bak.stat().st_size/1e6:.0f} MB)')
     if args.all:
         roots = [
             Path.home() / 'llama-server',
@@ -562,6 +688,8 @@ def main():
     p_idx.add_argument('--root', help='Directory to scan recursively')
     p_idx.add_argument('--all', action='store_true', help='Index full corpus (6797 files)')
     p_idx.add_argument('--max', type=int, default=0, dest='max_files', help='Max files')
+    p_idx.add_argument('--rebuild', action='store_true',
+                       help='Move the existing index aside and start fresh (the only way to shrink it)')
 
     # search
     p_srch = sub.add_parser('search', help='Search indexed corpus')
@@ -569,6 +697,9 @@ def main():
     p_srch.add_argument('--top-k', type=int, default=10, help='Results to return')
     p_srch.add_argument('--alpha', type=float, default=0.5, help='BM25 weight (0-1) for hybrid')
     p_srch.add_argument('--no-rerank', action='store_true', help='Skip cross-encoder rerank')
+
+    # compact
+    sub.add_parser('compact', help='Drop duplicate records from the index (atomic)')
 
     # info
     sub.add_parser('info', help='Show index statistics')
@@ -582,6 +713,9 @@ def main():
         cmd_index(args)
     elif args.cmd == 'search':
         cmd_search(args)
+    elif args.cmd == 'compact':
+        stats = compact_index()
+        print(json.dumps(stats, indent=2))
     elif args.cmd == 'info':
         cmd_info(args)
     elif args.cmd == 'docs':
