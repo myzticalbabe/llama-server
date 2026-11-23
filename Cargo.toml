@@ -9,7 +9,7 @@ inference server — Rust bindings for concurrent CPU / NPU / GPU inference.
 """
 keywords = ["llm", "inference", "llama", "sycl", "npu", "url", "server"]
 categories = ["api-bindings", "science"]
-license  = "MIT OR Apache-2.0"
+license  = "LicenseRef-SoulForge-1.0"
 rust-version = "1.75"
 
 [dependencies]
